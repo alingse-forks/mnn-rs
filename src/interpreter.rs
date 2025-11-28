@@ -81,8 +81,7 @@ impl core::ops::Deref for TensorCallback {
 /// - `Debug`
 /// - `Release`
 #[derive(Debug, Copy, Clone)]
-#[cfg_attr(windows, repr(i32))]
-#[cfg_attr(unix, repr(u32))]
+#[repr(u32)]
 pub enum SessionMode {
     #[doc = "About CallBack, Default Session_Debug*/\n/** runSessionWithCallBack is allowed and can get internal op info"]
     Debug = mnn_sys::SessionMode::Session_Debug,
@@ -118,9 +117,6 @@ pub enum SessionMode {
     ResizeFix = mnn_sys::SessionMode::Session_Resize_Fix,
 }
 
-#[cfg(windows)]
-type SessionModeType = i32;
-#[cfg(unix)]
 type SessionModeType = u32;
 
 impl SessionMode {

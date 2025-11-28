@@ -253,7 +253,7 @@ pub fn mnn_c_bindgen(vendor: impl AsRef<Path>, out: impl AsRef<Path>) -> Result<
 
 pub fn mnn_cpp_bindgen(vendor: impl AsRef<Path>, out: impl AsRef<Path>) -> Result<()> {
     let vendor = vendor.as_ref();
-    let bindings = bindgen::Builder::default()
+    let mut builder = bindgen::Builder::default()
         .clang_args(["-x", "c++"])
         .clang_args(["-std=c++14"])
         .clang_arg(CxxOption::VULKAN.cxx())
@@ -274,9 +274,46 @@ pub fn mnn_cpp_bindgen(vendor: impl AsRef<Path>, out: impl AsRef<Path>) -> Resul
                 .to_string_lossy(),
         )
         .allowlist_item(".*SessionInfoCode.*");
+
+    // Add MinGW C++ standard library include path for Windows cross-compilation
+    if *TARGET_OS == "windows" && *TARGET_ARCH == "x86_64" {
+        // Known MinGW C++ header paths for Homebrew installation
+        let mingw_base = "/opt/homebrew/Cellar/mingw-w64/13.0.0_2/toolchain-x86_64/x86_64-w64-mingw32";
+        let cxx_path = format!("{}/include/c++/15.2.0", mingw_base);
+        let target_cxx_path = format!("{}/include/c++/15.2.0/x86_64-w64-mingw32", mingw_base);
+        let include_path = format!("{}/include", mingw_base);
+
+        let paths_to_add = [
+            cxx_path.as_str(),
+            target_cxx_path.as_str(),
+            include_path.as_str(),
+        ];
+
+        for path in paths_to_add.iter() {
+            let path_obj = Path::new(path);
+            if path_obj.exists() {
+                builder = builder.clang_arg(format!("-I{}", path));
+
+                // Also add bits directory if it exists
+                let bits_path = path_obj.join("bits");
+                if bits_path.exists() {
+                    builder = builder.clang_arg(format!("-I{}", bits_path.to_string_lossy()));
+                }
+
+                println!("cargo:warning=Added MinGW include path: {}", path);
+            }
+        }
+
+        // Add target specification for cross-compilation
+        builder = builder.clang_arg("--target=x86_64-w64-mingw32");
+
+        // Add sysroot
+        builder = builder.clang_arg(format!("--sysroot={}", mingw_base));
+    }
+
+    let bindings = builder.generate()?;
     // let cmd = bindings.command_line_flags().join(" ");
     // println!("cargo:warn=bindgen: {}", cmd);
-    let bindings = bindings.generate()?;
     bindings.write_to_file(out.as_ref().join("mnn_cpp.rs"))?;
     Ok(())
 }
