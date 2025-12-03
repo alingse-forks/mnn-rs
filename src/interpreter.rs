@@ -1,6 +1,7 @@
 //! The interpreter module provides the `Interpreter` struct which is used to load and run models.
 use crate::tensor::list::TensorList;
 use std::{ffi::CStr, path::Path, sync::Arc};
+use std::env;
 
 use crate::{
     AsTensorShape, Device, RawTensor, Ref, RefMut, ScheduleConfig, Tensor, TensorType, prelude::*,
@@ -8,6 +9,14 @@ use crate::{
 use mnn_sys::HalideType;
 
 pub(crate) type TensorCallbackT = Box<dyn Fn(&[RawTensor], OperatorInfo) -> bool>;
+
+// Debug print for CARGO_CFG_TARGET_OS
+const _: () = {
+    #[allow(dead_code)]
+    fn debug_target_os() {
+        println!("cargo:warning=DEBUG[mnn-rs]: CARGO_CFG_TARGET_OS: {:?}", env::var("CARGO_CFG_TARGET_OS"));
+    }
+};
 
 #[repr(transparent)]
 pub(crate) struct TensorCallback {
@@ -82,7 +91,7 @@ impl core::ops::Deref for TensorCallback {
 /// - `Release`
 #[derive(Debug, Copy, Clone)]
 #[cfg_attr(windows, repr(i32))]
-#[cfg_attr(unix, repr(u32))]
+#[cfg_attr(not(windows), repr(u32))]
 pub enum SessionMode {
     #[doc = "About CallBack, Default Session_Debug*/\n/** runSessionWithCallBack is allowed and can get internal op info"]
     Debug = mnn_sys::SessionMode::Session_Debug,
@@ -118,14 +127,26 @@ pub enum SessionMode {
     ResizeFix = mnn_sys::SessionMode::Session_Resize_Fix,
 }
 
-#[cfg(windows)]
-type SessionModeType = i32;
-#[cfg(unix)]
-type SessionModeType = u32;
-
-impl SessionMode {
-    fn to_mnn_sys(self) -> SessionModeType {
-        self as SessionModeType
+impl From<SessionMode> for mnn_sys::SessionMode::Type {
+    fn from(mode: SessionMode) -> Self {
+        match mode {
+            SessionMode::Debug => mnn_sys::SessionMode::Session_Debug,
+            SessionMode::Release => mnn_sys::SessionMode::Session_Release,
+            SessionMode::InputInside => mnn_sys::SessionMode::Session_Input_Inside,
+            SessionMode::InputUser => mnn_sys::SessionMode::Session_Input_User,
+            SessionMode::OutputInside => mnn_sys::SessionMode::Session_Output_Inside,
+            SessionMode::OutputUser => mnn_sys::SessionMode::Session_Output_User,
+            SessionMode::ResizeDirect => mnn_sys::SessionMode::Session_Resize_Direct,
+            SessionMode::ResizeDefer => mnn_sys::SessionMode::Session_Resize_Defer,
+            SessionMode::BackendFix => mnn_sys::SessionMode::Session_Backend_Fix,
+            SessionMode::BackendAuto => mnn_sys::SessionMode::Session_Backend_Auto,
+            SessionMode::MemoryCollect => mnn_sys::SessionMode::Session_Memory_Collect,
+            SessionMode::MemoryCache => mnn_sys::SessionMode::Session_Memory_Cache,
+            SessionMode::CodegenDisable => mnn_sys::SessionMode::Session_Codegen_Disable,
+            SessionMode::CodegenEnable => mnn_sys::SessionMode::Session_Codegen_Enable,
+            SessionMode::ResizeCheck => mnn_sys::SessionMode::Session_Resize_Check,
+            SessionMode::ResizeFix => mnn_sys::SessionMode::Session_Resize_Fix,
+        }
     }
 }
 
@@ -188,7 +209,7 @@ impl Interpreter {
     /// **Warning:**
     /// It should be called before create session!
     pub fn set_session_mode(&mut self, mode: SessionMode) {
-        unsafe { mnn_sys::Interpreter_setSessionMode(self.inner, mode.to_mnn_sys()) }
+        unsafe { mnn_sys::Interpreter_setSessionMode(self.inner, mode as mnn_sys::SessionMode::Type) }
     }
 
     ///call this function to get tensors ready.
@@ -258,9 +279,14 @@ impl Interpreter {
         &mut self,
         schedule: crate::ScheduleConfig,
     ) -> Result<crate::session::Session> {
+        // Force print to stdout/stderr for debugging crash
+        println!("DEBUG[mnn-rs]: Interpreter::create_session called.");
         profile!("Creating session"; {
+            println!("DEBUG[mnn-rs]: Calling unsafe mnn_sys::Interpreter_createSession...");
             let session = unsafe { mnn_sys::Interpreter_createSession(self.inner, schedule.inner) };
+            println!("DEBUG[mnn-rs]: mnn_sys::Interpreter_createSession returned. Checking null...");
             assert!(!session.is_null());
+            println!("DEBUG[mnn-rs]: Session is not null. Wrapping in crate::session::Session...");
             Ok(crate::session::Session {
                 inner: session,
                 net: self.inner,

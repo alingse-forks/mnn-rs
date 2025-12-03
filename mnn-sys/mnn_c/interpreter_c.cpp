@@ -91,12 +91,28 @@ void Interpreter_setSessionHint(Interpreter *interpreter, int mode, int value) {
 // }
 Session *Interpreter_createSession(Interpreter *interpreter,
                                    const MNNScheduleConfig *config) {
+  printf("DEBUG[mnn_c]: Interpreter_createSession called.\n");
   auto mnn_interpreter = reinterpret_cast<MNN::Interpreter *>(interpreter);
   auto mnn_schedule_config =
       reinterpret_cast<const MNN::ScheduleConfig *>(config);
+  
+  if (mnn_interpreter == nullptr) {
+    printf("DEBUG[mnn_c]: Interpreter is NULL!\n");
+  } else {
+    printf("DEBUG[mnn_c]: Interpreter ptr: %p\n", mnn_interpreter);
+  }
 
-  return reinterpret_cast<Session *>(
-      mnn_interpreter->createSession(*mnn_schedule_config));
+  if (mnn_schedule_config == nullptr) {
+      printf("DEBUG[mnn_c]: ScheduleConfig is NULL!\n");
+  } else {
+      printf("DEBUG[mnn_c]: ScheduleConfig details - type: %d, numThread: %d\n", mnn_schedule_config->type, mnn_schedule_config->numThread);
+  }
+
+  printf("DEBUG[mnn_c]: Calling MNN::Interpreter::createSession...\n");
+  MNN::Session* session = mnn_interpreter->createSession(*mnn_schedule_config);
+  printf("DEBUG[mnn_c]: MNN::Interpreter::createSession returned session: %p\n", session);
+
+  return reinterpret_cast<Session *>(session);
 }
 // Session* Interpreter_createSessionWithRuntime(Interpreter* interpreter, const
 // ScheduleConfig* config, const RuntimeInfo* runtime) {

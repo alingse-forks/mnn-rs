@@ -6,6 +6,18 @@ use std::{
     path::{Path, PathBuf},
     sync::LazyLock,
 };
+static MACOS_SDK_PATH: LazyLock<String> = LazyLock::new(|| {
+    String::from_utf8(
+        std::process::Command::new("xcrun")
+            .arg("--show-sdk-path")
+            .output()
+            .expect("Failed to get macOS SDK path")
+            .stdout,
+    )
+    .expect("Invalid UTF-8 from xcrun")
+    .trim()
+    .to_string()
+});
 const VENDOR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/vendor");
 const MANIFEST_DIR: &str = env!("CARGO_MANIFEST_DIR");
 static TARGET_OS: LazyLock<String> =
@@ -186,6 +198,14 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+static IS_MSVC_TARGET: LazyLock<bool> = LazyLock::new(|| {
+    *TARGET_OS == "windows"
+        && *TARGET_ARCH == "x86_64"
+        && std::env::consts::OS != "windows" // Ensure we are cross-compiling
+});
+
+// ... (other functions)
+
 pub fn mnn_c_bindgen(vendor: impl AsRef<Path>, out: impl AsRef<Path>) -> Result<()> {
     let vendor = vendor.as_ref();
     let mnn_c = PathBuf::from(MANIFEST_DIR).join("mnn_c");
@@ -200,23 +220,40 @@ pub fn mnn_c_bindgen(vendor: impl AsRef<Path>, out: impl AsRef<Path>) -> Result<
         "schedule_c.h",
     ];
 
-    let bindings = bindgen::Builder::default()
-        // .clang_args(["-x", "c++"])
+    let mut builder = bindgen::Builder::default()
+        .clang_args(["-x", "c++"]) // Treat headers as C++
+        .clang_args(["-std=c++14"]) // Use C++14 standard
         .clang_arg(CxxOption::VULKAN.cxx())
         .clang_arg(CxxOption::METAL.cxx())
         .clang_arg(CxxOption::COREML.cxx())
         .clang_arg(CxxOption::OPENCL.cxx())
-        .pipe(|builder| {
-            if is_emscripten() {
-                println!("cargo:rustc-cdylib-link-arg=-fvisibility=default");
-                builder
-                    .clang_arg("-fvisibility=default")
-                    .clang_arg("--target=wasm32-emscripten")
-                    .clang_arg(format!("-I{}/sysroot/include", emscripten_cache()))
-            } else {
-                builder
-            }
-        })
+        .clang_arg("-D__STDC_LIMIT_MACROS");
+
+    // Only add macOS-specific flags when targeting macOS
+    if *TARGET_OS == "macos" {
+        builder = builder
+            .clang_arg("-D__APPLE__")
+            .clang_arg(format!("-isysroot{}", *MACOS_SDK_PATH));
+    }
+
+    if is_emscripten() {
+        println!("cargo:rustc-cdylib-link-arg=-fvisibility=default");
+        builder = builder
+            .clang_arg("-fvisibility=default")
+            .clang_arg("--target=wasm32-emscripten")
+            .clang_arg(format!("-I{}/sysroot/include", emscripten_cache()));
+    } else if *IS_MSVC_TARGET {
+        // When cross-compiling to MSVC from non-Windows, rely on cargo-xwin to set up the environment
+        // Clang will pick up INCLUDE, LIB, and PATH environment variables set by cargo-xwin.
+        builder = builder.clang_arg("--target=x86_64-pc-windows-msvc");
+        // No explicit -I or --sysroot needed here if cargo-xwin has properly configured the environment for clang.
+        // We'll add a check/guidance if the environment isn't set.
+        if std::env::var("INCLUDE").is_err() || std::env::var("LIB").is_err() {
+            println!("cargo:warning=When cross-compiling to x86_64-pc-windows-msvc from macOS/Linux, ensure you are using `cargo xwin build` or have correctly set `INCLUDE` and `LIB` environment variables pointing to the Windows SDK and MSVC toolchain.");
+        }
+    }
+        
+    let bindings = builder
         .clang_arg(format!("-I{}", vendor.join("include").to_string_lossy()))
         .pipe(|generator| {
             HEADERS.iter().fold(generator, |gen, header| {
@@ -232,12 +269,12 @@ pub fn mnn_c_bindgen(vendor: impl AsRef<Path>, out: impl AsRef<Path>) -> Result<
         .rustified_enum("MapType")
         .rustified_enum("halide_type_code_t")
         .rustified_enum("ErrorCode")
-        .rustified_enum("MNNGpuMode")
-        .rustified_enum("MNNForwardType")
-        .rustified_enum("RuntimeStatus")
+        .newtype_enum("MNNGpuMode")
+        .newtype_enum("MNNForwardType")
+        .newtype_enum("RuntimeStatus")
         .no_copy("CString")
         .generate_cstr(true)
-        .generate_inline_functions(true)
+        .generate_inline_functions(false)
         .size_t_is_usize(true)
         .emit_diagnostics()
         .detect_include_paths(std::env::var("TARGET") == std::env::var("HOST"))
@@ -253,16 +290,17 @@ pub fn mnn_c_bindgen(vendor: impl AsRef<Path>, out: impl AsRef<Path>) -> Result<
 
 pub fn mnn_cpp_bindgen(vendor: impl AsRef<Path>, out: impl AsRef<Path>) -> Result<()> {
     let vendor = vendor.as_ref();
-    let bindings = bindgen::Builder::default()
+    let mut builder = bindgen::Builder::default()
         .clang_args(["-x", "c++"])
         .clang_args(["-std=c++14"])
         .clang_arg(CxxOption::VULKAN.cxx())
         .clang_arg(CxxOption::METAL.cxx())
         .clang_arg(CxxOption::COREML.cxx())
         .clang_arg(CxxOption::OPENCL.cxx())
+        .clang_arg("-D__STDC_LIMIT_MACROS")
         .clang_arg(format!("-I{}", vendor.join("include").to_string_lossy()))
         .generate_cstr(true)
-        .generate_inline_functions(true)
+        .generate_inline_functions(false)
         .size_t_is_usize(true)
         .emit_diagnostics()
         .ctypes_prefix("core::ffi")
@@ -274,9 +312,28 @@ pub fn mnn_cpp_bindgen(vendor: impl AsRef<Path>, out: impl AsRef<Path>) -> Resul
                 .to_string_lossy(),
         )
         .allowlist_item(".*SessionInfoCode.*");
+
+    // Only add macOS-specific flags when targeting macOS
+    if *TARGET_OS == "macos" {
+        builder = builder
+            .clang_arg("-D__APPLE__")
+            .clang_arg(format!("-isysroot{}", *MACOS_SDK_PATH));
+    }
+
+    if *IS_MSVC_TARGET {
+        // When cross-compiling to MSVC from non-Windows, rely on cargo-xwin to set up the environment
+        // Clang will pick up INCLUDE, LIB, and PATH environment variables set by cargo-xwin.
+        builder = builder.clang_arg("--target=x86_64-pc-windows-msvc");
+        // No explicit -I or --sysroot needed here if cargo-xwin has properly configured the environment for clang.
+        // We'll add a check/guidance if the environment isn't set.
+        if std::env::var("INCLUDE").is_err() || std::env::var("LIB").is_err() {
+            println!("cargo:warning=When cross-compiling to x86_64-pc-windows-msvc from macOS/Linux, ensure you are using `cargo xwin build` or have correctly set `INCLUDE` and `LIB` environment variables pointing to the Windows SDK and MSVC toolchain.");
+        }
+    }
+
+    let bindings = builder.generate()?;
     // let cmd = bindings.command_line_flags().join(" ");
     // println!("cargo:warn=bindgen: {}", cmd);
-    let bindings = bindings.generate()?;
     bindings.write_to_file(out.as_ref().join("mnn_cpp.rs"))?;
     Ok(())
 }
@@ -288,6 +345,19 @@ pub fn mnn_c_build(path: impl AsRef<Path>, vendor: impl AsRef<Path>) -> Result<(
             || e.extension() == Some(std::ffi::OsStr::new("c"))
     });
     let vendor = vendor.as_ref();
+
+    // Special handling for Windows cross-compilation on macOS/Linux
+    if *IS_MSVC_TARGET {
+        let cc_env = std::env::var("CC_x86_64_pc_windows_msvc").or_else(|_| std::env::var("CC")).unwrap_or_default();
+        let is_clang_cl = cc_env.contains("clang-cl");
+
+        if !is_clang_cl {
+            anyhow::bail!("Building for x86_64-pc-windows-msvc on macOS/Linux requires `clang-cl` (typically provided by `cargo-xwin`).\n\
+                           Please install `cargo-xwin` (`cargo install cargo-xwin`) and then run your build command with `cargo xwin build ...`.\n\
+                           Ensure that the `INCLUDE` and `LIB` environment variables are correctly set for the Windows SDK and MSVC toolchain.");
+        }
+    }
+
     cc::Build::new()
         .include(vendor.join("include"))
         // .includes(vulkan_includes(vendor))
@@ -310,10 +380,11 @@ pub fn mnn_c_build(path: impl AsRef<Path>, vendor: impl AsRef<Path>) -> Result<(
             }
             #[cfg(feature = "crt_static")]
             config.static_crt(true);
+
+            // No bail logic here now, just configure config
             config
         })
         .cpp(true)
-        .static_flag(true)
         .files(files)
         .std("c++14")
         // .pipe(|build| {
@@ -334,8 +405,169 @@ pub fn mnn_c_build(path: impl AsRef<Path>, vendor: impl AsRef<Path>) -> Result<(
 
 pub fn build_cmake(path: impl AsRef<Path>, install: impl AsRef<Path>) -> Result<()> {
     let threads = std::thread::available_parallelism()?;
-    cmake::Config::new(path)
-        .define("CMAKE_CXX_STANDARD", "14")
+
+    // Special handling for Windows MSVC cross-compilation on macOS/Linux
+    // We manually run cmake to avoid cmake-rs injecting incompatible flags (like -A x64 with Unix Makefiles)
+    if *TARGET_OS == "windows" && *TARGET_ARCH == "x86_64" && std::env::consts::OS != "windows" {
+        let out_dir = PathBuf::from(std::env::var("OUT_DIR")?);
+        let build_dir = out_dir.join("build-mnn-manual");
+        
+        // Force clean build directory to avoid cache pollution
+        if build_dir.exists() {
+            std::fs::remove_dir_all(&build_dir)?;
+        }
+        std::fs::create_dir_all(&build_dir)?;
+        
+        let install_str = install.as_ref().to_string_lossy();
+        let path_str = path.as_ref().to_string_lossy();
+
+        // Detect compiler from environment variables
+        let target_env = "x86_64_pc_windows_msvc";
+        let cc_env = format!("CC_{}", target_env);
+        let cxx_env = format!("CXX_{}", target_env);
+
+        let cc = std::env::var(&cc_env).or_else(|_| std::env::var("CC")).unwrap_or_default();
+        let cxx = std::env::var(&cxx_env).or_else(|_| std::env::var("CXX")).unwrap_or_default();
+        let is_clang_cl = cc.contains("clang-cl");
+
+        let mut cmd = std::process::Command::new("cmake");
+        cmd.current_dir(&build_dir)
+           .arg(&*path_str)
+           .arg("-G").arg("Unix Makefiles")
+           .arg("-DCMAKE_CXX_STANDARD=14")
+           .arg("-DMNN_BUILD_SHARED_LIBS=OFF")
+           .arg("-DMNN_SEP_BUILD=OFF")
+           .arg("-DMNN_PORTABLE_BUILD=ON")
+           .arg("-DMNN_USE_SYSTEM_LIB=OFF")
+           .arg("-DMNN_BUILD_CONVERTER=OFF")
+           .arg("-DMNN_BUILD_TOOLS=OFF")
+           .arg(format!("-DCMAKE_INSTALL_PREFIX={}", install_str))
+           .arg("-DCMAKE_SYSTEM_NAME=Windows")
+           .arg("-DCMAKE_BUILD_TYPE=Release");
+
+        // Set CMAKE_SYSTEM_PROCESSOR based on TARGET_ARCH
+        if *TARGET_ARCH == "x86_64" {
+            cmd.arg("-DCMAKE_SYSTEM_PROCESSOR=AMD64");
+        } else if *TARGET_ARCH == "aarch64" {
+            cmd.arg("-DCMAKE_SYSTEM_PROCESSOR=ARM64");
+        } else if *TARGET_ARCH == "x86" {
+            cmd.arg("-DCMAKE_SYSTEM_PROCESSOR=X86");
+        }
+
+        if !is_clang_cl {
+            anyhow::bail!("Building for x86_64-pc-windows-msvc on macOS/Linux requires `clang-cl` (typically provided by `cargo-xwin`).\n\
+                           Please install `cargo-xwin` (`cargo install cargo-xwin`) and then run your build command with `cargo xwin build ...`.\n\
+                           Ensure that the `INCLUDE` and `LIB` environment variables are correctly set for the Windows SDK and MSVC toolchain.");
+        }
+        // Configure for clang-cl (MSVC simulation)
+        // Use exact target triple for clang-cl
+        let target_flag = "--target=x86_64-pc-windows-msvc";
+
+        // Get existing flags from cargo-xwin (which include sysroot paths)
+        let env_c_flags = std::env::var("CFLAGS").unwrap_or_default();
+        let env_cxx_flags = std::env::var("CXXFLAGS").unwrap_or_default();
+
+        // Explicitly add include paths for cargo-xwin's installed headers
+        let xwin_base_path = PathBuf::from(std::env::var("XWIN_CACHE_DIR").unwrap_or_else(|_| {
+            // Fallback for default cargo-xwin cache location on macOS
+            let home_dir = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            PathBuf::from(home_dir).join("Library/Caches/cargo-xwin/xwin").to_string_lossy().to_string()
+        }));
+        let crt_include = xwin_base_path.join("crt/include");
+        let sdk_include_base = xwin_base_path.join("sdk/include/10.0.26100"); // Hardcode SDK version for now
+
+        let sdk_ucrt_include = sdk_include_base.join("ucrt");
+        let sdk_um_include = sdk_include_base.join("um");
+        let sdk_shared_include = sdk_include_base.join("shared");
+
+        let mut extra_c_includes = String::new();
+        let mut extra_cxx_includes = String::new();
+
+        if crt_include.exists() {
+            extra_c_includes.push_str(&format!("/I{} ", crt_include.to_string_lossy()));
+            extra_cxx_includes.push_str(&format!("/I{} ", crt_include.to_string_lossy()));
+        }
+        if sdk_ucrt_include.exists() {
+            extra_c_includes.push_str(&format!("/I{} ", sdk_ucrt_include.to_string_lossy()));
+            extra_cxx_includes.push_str(&format!("/I{} ", sdk_ucrt_include.to_string_lossy()));
+        }
+        if sdk_um_include.exists() {
+            extra_c_includes.push_str(&format!("/I{} ", sdk_um_include.to_string_lossy()));
+            extra_cxx_includes.push_str(&format!("/I{} ", sdk_um_include.to_string_lossy()));
+        }
+        if sdk_shared_include.exists() {
+            extra_c_includes.push_str(&format!("/I{} ", sdk_shared_include.to_string_lossy()));
+            extra_cxx_includes.push_str(&format!("/I{} ", sdk_shared_include.to_string_lossy()));
+        }
+
+
+        let c_flags = format!("{} {} {} -DWIN32=1 /EHsc -msse4.1", env_c_flags, extra_c_includes, target_flag);
+        let cxx_flags = format!("{} {} {} -DWIN32=1 /EHsc -msse4.1", env_cxx_flags, extra_cxx_includes, target_flag);
+
+        cmd.arg(format!("-DCMAKE_C_COMPILER={}", cc))
+            .arg(format!("-DCMAKE_CXX_COMPILER={}", cxx))
+            .arg("-DCMAKE_RC_COMPILER=llvm-rc")
+            .arg("-DCMAKE_MT=llvm-mt")
+            .arg("-DCMAKE_LINKER=lld-link")
+            // Force Release configuration for compiler checks to avoid looking for msvcrtd.lib (Debug CRT)
+            .arg("-DCMAKE_TRY_COMPILE_CONFIGURATION=Release")
+            // Explicitly set runtime library to MultiThreadedDLL (/MD) to match Rust's default
+            .arg("-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL")
+            // Pass target flags to ensure clang-cl compiles for the correct target, not host
+            .arg(format!("-DCMAKE_C_FLAGS={}", c_flags))
+            .arg(format!("-DCMAKE_CXX_FLAGS={}", cxx_flags));
+
+        // Don't clear env vars for clang-cl, cargo-xwin needs them
+
+        
+        cmd.arg(format!("-DMNN_WIN_RUNTIME_MT={}", CxxOption::CRT_STATIC.cmake_value()))
+           .arg(format!("-DMNN_USE_THREAD_POOL={}", CxxOption::THREADPOOL.cmake_value()))
+           .arg(format!("-DMNN_OPENMP={}", CxxOption::OPENMP.cmake_value()))
+           .arg(format!("-DMNN_VULKAN={}", CxxOption::VULKAN.cmake_value()))
+           .arg(format!("-DMNN_METAL={}", CxxOption::METAL.cmake_value()))
+           .arg(format!("-DMNN_COREML={}", CxxOption::COREML.cmake_value()))
+           .arg(format!("-DMNN_OPENCL={}", CxxOption::OPENCL.cmake_value()))
+           .arg(format!("-DMNN_OPENGL={}", CxxOption::OPENGL.cmake_value()))
+           .arg("-DMNN_USE_SSE=OFF");
+           
+        // if *TARGET_OS == "windows" {
+        //    cmd.arg("-DCMAKE_CXX_FLAGS=-DWIN32=1");
+        // }
+
+        println!("Running manual cmake config: {:?}", cmd);
+        let status = cmd.status()?;
+        if !status.success() {
+            anyhow::bail!("Manual CMake configuration failed");
+        }
+
+        let mut build_cmd = std::process::Command::new("cmake");
+        build_cmd.current_dir(&build_dir)
+            .arg("--build").arg(".")
+            .arg("--config").arg("Release")
+            .arg("--parallel").arg(format!("{}", threads.get()));
+            
+        println!("Running manual cmake build: {:?}", build_cmd);
+        let status = build_cmd.status()?;
+        if !status.success() {
+            anyhow::bail!("Manual CMake build failed");
+        }
+
+        let mut install_cmd = std::process::Command::new("cmake");
+        install_cmd.current_dir(&build_dir)
+            .arg("--install").arg(".");
+            
+        println!("Running manual cmake install: {:?}", install_cmd);
+        let status = install_cmd.status()?;
+        if !status.success() {
+            anyhow::bail!("Manual CMake install failed");
+        }
+
+        return Ok(());
+    }
+
+    let mut config = cmake::Config::new(path);
+    
+    config.define("CMAKE_CXX_STANDARD", "14")
         .parallel(threads.get() as u8)
         .define("MNN_BUILD_SHARED_LIBS", "OFF")
         .define("MNN_SEP_BUILD", "OFF")
@@ -343,11 +575,15 @@ pub fn build_cmake(path: impl AsRef<Path>, install: impl AsRef<Path>) -> Result<
         .define("MNN_USE_SYSTEM_LIB", "OFF")
         .define("MNN_BUILD_CONVERTER", "OFF")
         .define("MNN_BUILD_TOOLS", "OFF")
-        .define("CMAKE_INSTALL_PREFIX", install.as_ref())
-        // https://github.com/rust-lang/rust/issues/39016
-        // https://github.com/rust-lang/cc-rs/pull/717
-        // .define("CMAKE_BUILD_TYPE", "Release")
-        .pipe(|config| {
+        .define("CMAKE_INSTALL_PREFIX", install.as_ref());
+
+
+
+    // https://github.com/rust-lang/rust/issues/39016
+    // https://github.com/rust-lang/cc-rs/pull/717
+    // .define("CMAKE_BUILD_TYPE", "Release")
+    
+    config.pipe(|mut config| {
             config.define("MNN_WIN_RUNTIME_MT", CxxOption::CRT_STATIC.cmake_value());
             config.define("MNN_USE_THREAD_POOL", CxxOption::THREADPOOL.cmake_value());
             config.define("MNN_OPENMP", CxxOption::OPENMP.cmake_value());
@@ -356,10 +592,12 @@ pub fn build_cmake(path: impl AsRef<Path>, install: impl AsRef<Path>) -> Result<
             config.define("MNN_COREML", CxxOption::COREML.cmake_value());
             config.define("MNN_OPENCL", CxxOption::OPENCL.cmake_value());
             config.define("MNN_OPENGL", CxxOption::OPENGL.cmake_value());
+            config.define("MNN_USE_SSE", "ON");
             // config.define("CMAKE_CXX_FLAGS", "-O0");
             // #[cfg(windows)]
             if *TARGET_OS == "windows" {
-                config.define("CMAKE_CXX_FLAGS", "-DWIN32=1");
+                config.define("CMAKE_CXX_FLAGS", "-DWIN32=1 -msse4.1");
+                config.define("CMAKE_C_FLAGS", "-DWIN32=1 -msse4.1");
             }
 
             if is_emscripten() {
@@ -485,7 +723,7 @@ impl CxxOption {
     pub const OPENCL: CxxOption = cxx_option_from_feature!("opencl", "MNN_OPENCL");
     pub const OPENMP: CxxOption = cxx_option_from_feature!("openmp", "MNN_OPENMP");
     pub const OPENGL: CxxOption = cxx_option_from_feature!("opengl", "MNN_OPENGL");
-    pub const CRT_STATIC: CxxOption = cxx_option_from_feature!("opengl", "MNN_WIN_RUNTIME_MT");
+    pub const CRT_STATIC: CxxOption = cxx_option_from_feature!("crt_static", "MNN_WIN_RUNTIME_MT");
     pub const THREADPOOL: CxxOption =
         cxx_option_from_feature!("mnn-threadpool", "MNN_USE_THREAD_POOL");
 
